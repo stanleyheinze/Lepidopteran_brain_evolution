@@ -1,0 +1,790 @@
+---
+title: "Moth_brain_comparative_analysis"
+author: "Andrea Adden"
+date: "2025-08-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## README
+
+This is a collection of code that produces plots for figures 1, 5, 6, 7, and 8
+of Adden et al.: "The evolution of lepidopteran brain morphology".
+
+## Load R packages
+```{r packages, echo=FALSE}
+library('tidyverse')
+library('viridis')
+library('reshape2')
+library('rstudioapi')
+library('nlme')
+library('caper')
+library('phytools')
+library('phylolm')
+library('car')
+library('pheatmap')
+library('geiger')
+```
+
+# Clear workspace
+```{r setup, include=FALSE}
+rm(list = ls())
+```
+
+# Load data
+```{r load data}
+# RData file containing moth data
+load("moths.RData")
+
+# Phylogenetic tree
+tree <- read.tree("Kawahara_etal_2019_pruned.tree")
+```
+
+## FIGURE 1
+
+# 1A: Phylogenetic tree
+```{r plot phylo}
+plot.phylo(root(tree, outgroup = "Rnub"), type = "phylogram", use.edge.length = TRUE)
+add.scale.bar(length = 0.1)
+```
+
+# 1B: Absolute brain volume vs. wingspan
+```{r}
+# function for nth root, for wingspan plot
+nthroot = function(x,n) {
+  (abs(x)^(1/n))*sign(x)
+}
+
+# prepare wingspan dataframe
+wings <- moths %>%
+  group_by(Species) %>%
+  summarise(totalV = mean(totalV),
+            Wingspan = mean(Wingspan),
+            Origin = unique(Origin),
+            .groups = "drop"
+            )
+wings <- as.data.frame(wings)
+
+## phylogenetically corrected GLM, log-log transformed
+
+rownames(wings) <- wings$Species
+wings$Wingspan <- log((wings$Wingspan)) # log transform
+wings$totalV <- log(nthroot(wings$total,3)) # log transform and reduce dimension
+
+# model
+wings_pgls <- phylolm(totalV ~ Wingspan, data = wings, phy = tree, model = "BM", boot = 1000)
+summary(wings_pgls)
+
+# check whether the slope is significantly different from isometry (F-test)
+linearHypothesis(wings_pgls, "Wingspan = 1") 
+
+# get the adjusted R-squared
+wings_pgls$adj.r.squared
+
+# plot
+ggplot(wings, aes(x = Wingspan, y = totalV)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Log wingspan", 
+    y = "Log 3rd root Total Brain Volume",
+    title = paste("PGLS: Adjusted R-squared =", wings_pgls$adj.r.squared)
+  ) +
+  theme_classic() +
+  geom_text(aes(x=Wingspan+0.075, y=totalV, label=Species)) +
+  geom_abline(intercept = 5, slope = 1, col = 'grey')
+
+```
+
+# 1C: Absolute volume by species
+
+```{r absolute volumes}
+ggplot(aggregate(moths, totalV ~ Species + Sample + Group, FUN=mean), aes(x = Species, y = totalV, fill = Group)) +
+  geom_boxplot(notch = F, notchwidth = 0.9, width = 0.75, outlier.shape = NA, position = position_dodge2()) +
+  facet_wrap(~Group, scales='free_x') + # set to 'free_x' for final version
+  scale_fill_viridis(discrete = T, alpha = 0.6) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.15), size = 1) +
+  theme_classic() +
+  ylim(0, NA) +
+  xlab("Species") +
+  ylab("Total brain volume (µm^3)") +
+  guides(alpha = "none")
+
+```
+
+## FIGURE 5
+
+# Phylogenetic signal: Blomberg's K
+
+```{r prepare data, echo=FALSE}
+# create moths.var dataframe: we need to remove all neuropils that don't have a
+# match across species (e.g. the mushroom body in Danaus plexippus), as well as
+# the uCB. Also remove outgroup R. nubila
+moths.var <- moths %>%
+  filter(!(Neuropil %in% c("MB", "LA", "SP", "uCB"))) %>%
+  filter(Species != "Rnub") %>%
+  # sum across hemispheres per sample
+  group_by(Species, Sample, Superregion, Neuropil,Lifestyle.1, Lifestyle.2) %>%
+  reframe(sum.V = sum(Volume, na.rm = TRUE),
+            centralV = centralV
+            ) %>%
+  # average across sample per species
+  group_by(Species, Superregion, Neuropil, Lifestyle.1, Lifestyle.2) %>%
+  reframe(mean.V = mean(sum.V, na.rm = TRUE),
+            mean.centralV = mean(centralV, na.rm = TRUE)
+            )
+
+moths.var$mean.relV <- moths.var$mean.V / moths.var$mean.centralV
+
+moths.var$mean.relV[moths.var$mean.relV==0] <- NA
+moths.var$mean.V[moths.var$mean.V==0] <- NA
+# log transform
+moths.var$log.mean.relV <- log(moths.var$mean.relV)
+```
+
+# Blomberg's K -- test function
+```{r test K vs 1 function}
+# function: test K vs. 1 by comparing to simulated distribution
+test_K_vs_one_by_sim <- function(temptree, trait_vec, nsim = 10000, plot = TRUE){
+  # ensure tip order and names match
+  if(is.null(names(trait_vec))) stop("trait_vec must be a named vector with names matching tree$tip.label")
+  if(!all(temptree$tip.label %in% names(trait_vec))) stop("Not all tree tip labels are present in trait_vec names")
+  trait_vec <- trait_vec[temptree$tip.label]   # reorder to match tree tips
+  
+  # 1) Fit BM to observed data and extract ML sigma^2 and root
+  fitBM <- fitContinuous(temptree, data.frame(trait = trait_vec), model = "BM")
+  if(is.null(fitBM$opt$sigsq)) stop("Could not extract sigma^2 from fitContinuous result (fitBM$opt$sigsq).")
+  sigma2_hat <- fitBM$opt$sigsq
+  z0_hat <- if(!is.null(fitBM$opt$z0)) fitBM$opt$z0 else mean(trait_vec)
+  
+  # 2) Observed K (use test = FALSE to get numeric)
+  K_obs <- phylosig(temptree, trait_vec, method = "K", test = TRUE)
+
+# 3) Simulate nsim datasets under fitted BM and compute K for each
+  Ks <- numeric(nsim)
+  pb <- txtProgressBar(min = 0, max = nsim, style = 3)
+  for(i in seq_len(nsim)) {
+    sim_trait <- fastBM(temptree, a = z0_hat, sig2 = sigma2_hat)   # named vector in tree tip order
+    Ks[i] <- phylosig(temptree, sim_trait, method = "K", test = FALSE)
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  # 4) Summaries & empirical test vs 1 (two-sided on |K - 1|)
+  mean_K <- mean(Ks, na.rm = TRUE)
+  sd_K <- sd(Ks, na.rm = TRUE)
+  ci_95 <- quantile(Ks, probs = c(0.025, 0.975), na.rm = TRUE)
+  
+  # two-sided empirical p-value comparing |K-1|
+  obs_dev <- abs(K_obs$K - 1)
+  sim_dev <- abs(Ks - 1)
+  p_empirical_two_sided <- (sum(sim_dev >= obs_dev, na.rm = TRUE) + 1) / (sum(!is.na(sim_dev)) + 1) # add-one correction
+  
+  # z-like score (warning: K distribution may be skewed; use empirical p-value instead)
+  z_like <- (K_obs$K - 1) / sd_K
+  
+  result <- list(
+    K_obs = K_obs$K,
+    mean_K_under_BM = mean_K,
+    sd_K_under_BM = sd_K,
+    ci_95_K_under_BM = ci_95,
+    Ks_sim = Ks,
+    nsim = nsim,
+    p_empirical_two_sided_vs1 = p_empirical_two_sided,
+    z_like = z_like,
+    fitBM = fitBM,
+    p_overserved_vs0 = K_obs$P
+  )
+  return(result)
+  
+  # plot (for plot=TRUE)
+  if(plot) {
+    hist(Ks, breaks = 40, freq = FALSE,
+         main = "Sampling distribution of Blomberg's K under fitted BM",
+         xlab = "K (simulated under fitted BM)")
+    abline(v = 1, col = "blue", lty = 2, lwd = 2)                      # BM expectation ≈ 1
+    abline(v = K_obs, col = "red", lwd = 2)                            # observed K
+    abline(v = ci_95, col = "darkgreen", lty = 3, lwd = 2)             # empirical 95% CI
+    legend("topright",
+           legend = c(sprintf("BM expectation = 1"),
+                      sprintf("Observed K = %.3f", K_obs),
+                      sprintf("Empirical 95%% CI: [%.3f, %.3f]", ci_95[1], ci_95[2])),
+           col = c("blue","red","darkgreen"),
+           lty = c(2,1,3), bty = "n")
+  }
+}
+```
+
+# compute Blomberg's K
+```{r compute phylogenetic signal, echo=FALSE}
+# prepare results dataframe
+results_observed <- data.frame(Neuropil = NA,
+                      K = NA,
+                      K_pval0 = NA,
+                      simK = NA,
+                      K_CI_lower = NA,
+                      K_CI_upper = NA)
+
+
+
+# drop outgroup tips from tree
+tree <- drop.tip(tree, c("Tcas", "Rnub"))
+
+Ks_list <- list()
+all_Ks <- list()
+ssuper <- sort(unique(moths.var$Neuropil))
+
+# set number of simulations
+nsim = 10000
+  
+# loop through each neuropil and calculate Blomberg's K
+for (i in 1:length(ssuper)) { 
+  # Subset data for the current neuropil
+  data <- as.data.frame(subset(moths.var, Neuropil == ssuper[i]))
+  tmp.np <- ssuper[i]
+  # Ensure species match between data and tree
+  data <- data[data$Species %in% tree$tip.label, ]
+  temp_tree <- drop.tip(tree, setdiff(tree$tip.label, data$Species))  # Use a copy of the tree
+
+  #Ensure data is ordered correctly
+  data <- data[match(temp_tree$tip.label, data$Species), ]
+  rownames(data) <- data$Species  # Set species names as row names
+  
+  # impute missing mean volumes using phylogenetic regression
+  if (any(is.na(data$mean.V)) == TRUE) {
+    model <- phylolm(mean.V ~ Lifestyle.1 + Lifestyle.2, data = data, phy = temp_tree, model = "BM")
+    # Predict for all rows in the dataset (including those with missing values)
+    predictions <- predict(model, newdata = data)
+
+    # Replace only the missing values in mean.V with the predictions
+    data$mean.V[is.na((data$mean.V))] <- predictions[is.na(data$mean.V)]
+  } else {
+      
+    }
+  
+  # prepare phylosig variable: basically the same as mean.relV, but forPhylosig
+  # includes imputed values
+  data$forPhylosig <- data$mean.V / data$mean.centralV
+  vol_named <- setNames(data$forPhylosig, data$Species)
+  
+  # compute phylogenetic signal: Blomberg's K
+  obsK_res <- phylosig(temp_tree, vol_named, method="K", nsim=nsim, test=TRUE)
+
+  # Fit BM to your trait data
+  fitBM <- fitContinuous(temp_tree, subset(data, select = forPhylosig), model="BM")
+
+  # Extract ML estimates
+  sigma2_hat <- fitBM$opt$sigsq   # BM rate of evolution (σ²)
+  z0_hat     <- fitBM$opt$z0      # estimated root value (ancestral state)
+  
+  # Now simulate under this fitted BM model
+  Ks_phyl <- numeric(nsim)
+  
+  for(j in 1:nsim){
+    sim <- fastBM(temp_tree, a=z0_hat, sig2=sigma2_hat)
+    Ks_phyl[j] <- phylosig(temp_tree, sim, method="K")
+  }
+  
+  CI <- quantile(Ks_phyl, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+  # Store results
+  tt <- data.frame(Neuropil = tmp.np,
+                      K = obsK_res$K,
+                      K_pval0 = obsK_res$P,
+                      simK = Ks_phyl,
+                      K_CI_lower = CI[[1]],
+                      K_CI_upper = CI[[3]])
+  results_observed <- rbind(results_observed, tt)
+  
+  ##############  Test K against 1  ############## 
+  
+  # run function
+  res <- test_K_vs_one_by_sim(temp_tree, vol_named, nsim = nsim, plot = FALSE)
+  
+  # store results in dataframe
+  results <- data.frame(Neuropil = tmp.np, K_obs = res$K_obs, K_sim = res$mean_K_under_BM,
+    p_vs0 = res$p_overserved_vs0, p_vs1 = res$p_empirical_two_sided_vs1,
+    CI_lower <- res$ci_95_K_under_BM[[1]], CI_upper = res$ci_95_K_under_BM[[2]])
+  
+  all_Ks[[i]] <- results
+  rm(Ks_phyl)
+  }
+
+# combine simulated K for all neuropils -- CAUTION: this is simulated K based on
+# random z and sigma2, not based on phylogeny
+all_Ks_df <- bind_rows(all_Ks)
+```
+
+```{r}
+CI_plot <- results_observed %>%
+  group_by(Neuropil) %>%
+  reframe(CI_upper = mean(K_CI_upper),
+          CI_lower = mean(K_CI_lower),
+          obsK = mean(K),
+          K_p0 = mean(K_pval0))
+
+pval_BM <- all_Ks_df %>%
+  group_by(Neuropil) %>%
+  reframe(obsK = mean(K_obs),
+          simK = mean(K_sim),
+          K_p0 = mean(p_vs0),
+          K_p1 = mean(p_vs1),
+          CI_upper = mean(CI_upper),
+          CI_lower = mean(CI_lower))
+
+ggplot(data=results_observed, aes(x=Neuropil, y=simK)) +
+  geom_violin(fill="lightgrey", width = 0.8) +
+  # observed K as red point
+  geom_point(data=CI_plot, aes(x=Neuropil, y=obsK), color = "red", size = 3) +
+  geom_point(data=CI_plot, aes(x=Neuropil, y=CI_upper), color = "black", size = 1) +
+  geom_point(data=CI_plot, aes(x=Neuropil, y=CI_lower), color = "black", size = 1) +
+  # dashed line at 1
+  geom_hline(yintercept = 1, linetype = "dashed", color = "blue") +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = "Neuropil",
+    y = "Blomberg's K (simulated under BM)",
+    title = "Observed K vs permutation-based null distribution"
+  ) +
+  geom_text(data = CI_plot, aes(x=Neuropil, y= obsK, label=paste0("p0=", signif(K_p0 ,3))),
+               vjust=-1, size=3, color="red") +
+  geom_text(data = pval_BM, aes(x=Neuropil, y=obsK, label=paste0("p1=", signif(K_p1 ,3))),
+               vjust=-3, size=3, color="red")
+
+```
+## Figure 6: Slope index and correlation across neuropils
+
+# Figure 6A: Ellipsoid body scaling
+```{r 6A Ellipsoid body scaling}
+rm(dsub)
+
+dsub <- as.data.frame(subset(moths.var, Neuropil == 'EB'))
+rownames(dsub) <- dsub$Species
+
+pgls_phylolm <- phylolm(log(mean.V) ~ log(mean.centralV), data = dsub, phy = tree, model = "BM", boot = 1000)
+summary(pgls_phylolm)
+
+# F-test to compare the slope to 1
+linearHypothesis(pgls_phylolm, "log(mean.centralV) = 1") 
+
+# plot
+ggplot(dsub, aes(x = log(mean.centralV), y = log(mean.V))) +
+  geom_point(size = 2) +
+  #geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Log central brain volume - neuropil volume", 
+    y = "Log mean neuropil volume",
+    title = paste("pgls LUC: Adjusted R-squared =", pgls_phylolm$adj.r.squared)
+  ) +
+  theme_classic() +
+  geom_text(aes(x=log(mean.centralV)+0.2, y=log(mean.V), label=Species)) +
+  geom_abline(intercept = pgls_phylolm$coefficients[[1]], slope = pgls_phylolm$coefficients[[2]], col = 'red') +
+  geom_abline(intercept = -5, slope = 1, col = 'grey') # isometric
+
+```
+
+# Figure 6B: Lobula vs Lobula plate OLS and PGLS regressions
+```{r 6B LO vs LOP OLS and PGLS}
+# prepare correlation structure
+moths.cor <- melt(moths.var, c('Species', 'Neuropil', 'Superregion'), 'log.mean.relV')
+moths.cor <- dcast(moths.cor, Species ~ Neuropil)
+moths.cor <- subset(moths.cor, Species != 'Rnub')
+rownames(moths.cor) <- moths.cor$Species
+
+# Prepare your comparative data object (with phylogeny)
+tree$node.label<-NULL
+comp_data <- comparative.data(phy = tree, data = moths.cor, names.col = "Species")
+cor_struct <- corBrownian(phy=tree)
+
+# PGLS
+model <- phylolm("LO ~ LOP", data = moths.cor, phy = tree, model = "BM", boot = 1000)
+summary(model)
+
+# OLS
+model_glm <- gls(as.formula('LO ~ LOP'), data=moths.cor, method="ML")
+
+# plot PGLS vs OLS
+ggplot(moths.cor, aes(x = LOP, y = LO)) +
+  geom_point() +
+  #geom_line(aes(y = fit), color = "blue", size = 1) +
+  geom_abline(intercept = model_glm$coefficients[[1]], slope = model_glm$coefficients[[2]], col = 'blue') +
+  geom_abline(intercept = model$coefficients[[1]], slope = model$coefficients[[2]], col = 'red') +
+  geom_abline(intercept = 0.5, slope = 1, col = 'grey') +
+  labs(title = "PGLS (blue) vs OLS (red): LO ~ LOP",
+       x = "log relative volume LOP", y = "log relative volume LO") +
+  theme_minimal()
+
+
+```
+
+# Figure 6D, E: Correlation analysis of scaling relationships
+```{r}
+# prepare empty correlation matrix
+neuropils <- colnames(moths.cor)[2:ncol(moths.cor)]  # because first column is species
+correlation_matrix <- matrix(NA, nrow=length(neuropils), ncol=length(neuropils))
+rownames(correlation_matrix) <- colnames(correlation_matrix) <- neuropils
+
+# prepare empty R2 matrix
+r2_matrix <- matrix(NA, nrow=length(neuropils), ncol=length(neuropils))
+rownames(r2_matrix) <- colnames(r2_matrix) <- neuropils
+
+# create correlation structure based on phylogenetic tree
+cor_struct <- corBrownian(phy=tree)
+
+# loop through all pairs of neuropils and run PGLS
+for (i in 1:(length(neuropils)-1)) {
+  for (j in (i+1):length(neuropils)) {
+    
+    # first, we want to extract the neuropil volumes for the pair of neuropils,
+    # along with the species column
+    model_data <- moths.cor[, c("Species", neuropils[i], neuropils[j])]
+    
+    # if volume is NA for both neuropils, remove row
+    model_data_no_na <- model_data[!is.na(model_data[, neuropils[i]]) & !is.na(model_data[, neuropils[j]]), ]
+    
+    # check that we still have data after removing NAs
+    if (nrow(model_data_no_na) > 1) {
+      
+      # PGLS to test correlation between neuropils
+      model <- phylolm(paste(neuropils[i], "~", neuropils[j]), data = model_data_no_na, phy = tree, model = "BM", boot = 1000)
+      
+      # store correlation coefficients
+      correlation_matrix[i, j] <- summary(model)$coefficients[[2]] # correlation coefficient
+      correlation_matrix[j, i] <- correlation_matrix[i, j] # because the matrix is symmetric
+      r2_matrix[i, j] <- summary(model)$coefficients[[2,6]] # R2
+      r2_matrix[j, i] <- r2_matrix[i, j] # because matrix is symmetric
+    } else {
+      # if there is not enough data to run PGLS, fill with NAs
+      correlation_matrix[i, j] <- NA
+      correlation_matrix[j, i] <- NA
+      r2_matrix[i, j] <- NA  
+      r2_matrix[j, i] <- NA  
+    }
+  }
+}
+
+# show correlation matrices
+print(correlation_matrix)
+print(r2_matrix)
+
+p_value_matrix <- r2_matrix
+# heatmap with centered color scale
+my_colors <- colorRampPalette(c("blue", "white", "orange"))(100)
+
+# convert p-value matrix to stars based on the significance thresholds
+p_threshold_1 <- 0.05
+p_threshold_2 <- 0.01
+p_threshold_3 <- 0.001
+pval_annotations <- ifelse(p_value_matrix < p_threshold_3, "***", 
+                           ifelse(p_value_matrix < p_threshold_2, "**", 
+                                  ifelse(p_value_matrix < p_threshold_1, "*", "")))
+
+# define custom breaks
+min_val <- min(correlation_matrix, na.rm = TRUE)
+max_val <- max(correlation_matrix, na.rm = TRUE)
+
+if (min_val < 0 & max_val > 0) {
+  # split breaks at 0
+  breaks <- c(seq(min_val, 0, length.out = 50), 
+              seq(0.0001, max_val, length.out = 51)) # Slightly offset to avoid duplicates
+} else {
+  breaks <- seq(min_val, max_val, length.out = 101)
+}
+
+# plot as heatmap with hierarchical clustering
+pheatmap(correlation_matrix,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         breaks = breaks,
+         display_numbers = pval_annotations, # p-value stars
+         number_color = "black", # for p-values
+         fontsize_number = 12, # p-value font size
+         color = colorRampPalette(c("blue", "white", "orange"))(100),
+         legend = TRUE,
+         main = "Hierarchical correlation heatmap with p-values"
+         )
+```
+
+# Figure 6C: Slope index across neuropils
+```{r}
+rm('neuropil_pgls', 'tmp_pgls')
+
+for (i in 1:length(ssuper)) {
+  dtmp <- as.data.frame(subset(moths.var, Neuropil == ssuper[i]))
+  rownames(dtmp) <- dtmp$Species
+  pgls <- phylolm(log(mean.V) ~ log(mean.centralV), data = dtmp, phy = tree, model = "BM", boot = 1000) # allow different slopes
+  
+  # compare regression to isometry <- are slopes significantly different?
+  chisq <- linearHypothesis(pgls, "log(mean.centralV) = 1")$Chisq[2]
+  p <- linearHypothesis(pgls, "log(mean.centralV) = 1")$`Pr(>Chisq)`[2]
+  r2 <- pgls$adj.r.squared
+  intercept <- pgls$coefficients[[1]]
+  slope <- pgls$coefficients[[2]]
+  
+  # compile temp dataframe
+  tmp_pgls <- data.frame(Neuropil = ssuper[i],
+                         r2 = r2,
+                         intercept = intercept,
+                         slope = slope,
+                         slopetest.chisq = chisq,
+                         slopetest.p = p,
+                         si = slope - 1
+                         )
+  
+  if (exists("neuropil_pgls")) {
+    neuropil_pgls <- rbind(neuropil_pgls, tmp_pgls)
+  } else {
+    neuropil_pgls <- tmp_pgls
+  }
+}
+# If R-squared is below 0.5, disregard:
+for (i in 1:length(neuropil_pgls$r2)) {
+    if (neuropil_pgls$r2[i] <0.6) {
+    neuropil_pgls$keep[i] <- FALSE
+  } else {
+    neuropil_pgls$keep[i] <- TRUE
+  }
+}
+
+pgls.n.isometry <- neuropil_pgls
+
+# plot
+ggplot(subset(pgls.n.isometry, keep == TRUE), aes(x=Neuropil, y=si)) + 
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  geom_text(data = subset(pgls.n.isometry, keep == TRUE), aes(x=Neuropil, y=si, label=round(slopetest.p, 4)), vjust=-0.1) +
+  geom_text(data = subset(pgls.n.isometry, keep == TRUE), aes(x=Neuropil, y=-0.5, label=paste('R2 =',round(r2, 2)))) +
+  scale_y_continuous(breaks = c(-0.4, -0.2, 0, 0.2))
+```
+
+## Figure 7: Diurnal vs nocturnal
+
+# 7A: PGLS regression for medulla of optic lobe
+```{r 7A: ME scaling}
+rm(dsub)
+
+dsub <- as.data.frame(subset(moths.var, Neuropil == 'ME'))
+rownames(dsub) <- dsub$Species
+
+pgls_phylolm <- phylolm(log(mean.V) ~ log(mean.centralV) + Lifestyle.2, data = dsub, phy = tree, model = "BM", boot = 1000)
+summary(pgls_phylolm)
+
+# F-test to compare the slope to 1
+linearHypothesis(pgls_phylolm, "log(mean.centralV) = 1") 
+
+# plot
+ggplot(dsub, aes(x = log(mean.centralV), y = log(mean.V), colour = Lifestyle.2)) +
+  geom_point(size = 2) +
+  #geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Log central brain volume - neuropil volume", 
+    y = "Log mean neuropil volume",
+    title = paste("pgls ME: Adjusted R-squared =", pgls_phylolm$adj.r.squared)
+  ) +
+  theme_classic() +
+  geom_text(aes(x=log(mean.centralV)+0.2, y=log(mean.V), label=Species)) +
+  geom_abline(intercept = pgls_phylolm$coefficients[[1]], slope = pgls_phylolm$coefficients[[2]], col = 'red') + 
+  geom_abline(intercept = pgls_phylolm$coefficients[[1]]+pgls_phylolm$coefficients[[3]], slope = pgls_phylolm$coefficients[[2]], col = 'turquoise') + 
+  geom_abline(intercept = -5, slope = 1, col = 'grey') 
+```
+
+# 7C: Grade shift index
+```{r 7C GSI diurnal vs nocturnal}
+rm('neuropil_pgls', 'tmp_pgls')
+
+for (i in 1:length(ssuper)) {
+  dtmp <- as.data.frame(subset(moths.var, Neuropil == ssuper[i]))
+  rownames(dtmp) <- dtmp$Species
+  pgls1 <- phylolm(log(mean.V) ~ log(mean.centralV) * Lifestyle.2, data = dtmp, phy = tree, model = "BM", boot = 1000) # allow different slopes
+  pgls2 <- phylolm(log(mean.V) ~ log(mean.centralV) + Lifestyle.2, data = dtmp, phy = tree, model = "BM", boot = 1000) # assume same slope
+  
+  # compare models <- are slopes significantly different?
+  chisq <- linearHypothesis(pgls1, "log(mean.centralV):Lifestyle.2nocturnal = 0")$Chisq[2]
+  p <- linearHypothesis(pgls1, "log(mean.centralV):Lifestyle.2nocturnal = 0")$`Pr(>Chisq)`[2]
+  
+  # compile temp dataframe
+  tmp_pgls <- data.frame(Neuropil = ssuper[i],
+                         r2.pgls1 = pgls1$adj.r.squared,
+                         r2.pgls2 = pgls2$adj.r.squared,
+                         intercept.diu = pgls2$coefficients[1],
+                         intercept.noc = pgls2$coefficients[1] + pgls2$coefficients[3],
+                         slope.diu = pgls1$coefficients[2],
+                         slope.noc = pgls1$coefficients[2] + pgls1$coefficients[4],
+                         slopetest.comp.chisq = chisq,
+                         slopetest.comp.p = p,
+                         intercepttest.comp.chisq = linearHypothesis(pgls2, "Lifestyle.2nocturnal = 0")$Chisq[2],
+                         intercepttest.comp.p = linearHypothesis(pgls2, "Lifestyle.2nocturnal = 0")$`Pr(>Chisq)`[2],
+                         si.diu = pgls1$coefficients[2] -1,
+                         si.noc = pgls1$coefficients[2] + pgls1$coefficients[4] -1
+                         )
+  tmp_pgls$gsi <- ( 10^tmp_pgls$intercept.diu / 10^tmp_pgls$intercept.noc ) -1 
+  
+  if (p > 0.05) {
+    tmp_pgls$slope.sig <- FALSE
+  } else {
+    tmp_pgls$slope.sig <- TRUE
+  }
+  
+  if (exists("neuropil_pgls")) {
+    neuropil_pgls <- rbind(neuropil_pgls, tmp_pgls)
+  } else {
+    neuropil_pgls <- tmp_pgls
+  }
+}
+# If R-squared is below 0.5, or slopes are significantly different, disregard:
+for (i in 1:length(neuropil_pgls$r2.pgls2)) {
+    if (neuropil_pgls$r2.pgls2[i] <0.6 | neuropil_pgls$slopetest.comp.p[i] <0.05) {
+    neuropil_pgls$keep[i] <- FALSE
+  } else {
+    neuropil_pgls$keep[i] <- TRUE
+  }
+}
+
+pgls.lifestyle.act <- neuropil_pgls
+
+# plot
+ggplot(subset(pgls.lifestyle.act, keep == TRUE), aes(x=Neuropil, y=gsi)) + 
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  geom_text(data = subset(pgls.lifestyle.act, keep == TRUE), aes(x=Neuropil, y=gsi, label=round(intercepttest.comp.p, 4)), vjust=-0.1) +
+  geom_text(data = subset(pgls.lifestyle.act, keep == TRUE), aes(x=Neuropil, y=-0.5, label=round(r2.pgls2, 2)))
+```
+
+# 7B: Significant slope index differences (disqualified from grade shift index)
+```{r}
+slope.act <- pgls.lifestyle.act %>%
+  filter(slope.sig == "TRUE") %>%
+  subset(select = c(Neuropil, si.diu, si.noc, slopetest.comp.p, r2.pgls1)) %>%
+  pivot_longer(c(si.diu, si.noc), names_to = "Act", values_to = "SI") 
+  
+slope.act <- as.data.frame(slope.act)
+
+# plot
+ggplot(slope.act, aes(x=Neuropil, y=SI, fill=Act)) + 
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_classic() +
+  scale_fill_viridis_d(alpha = 0.7) +
+  geom_text(data = slope.act, aes(x=Neuropil, y=SI, label=round(slopetest.comp.p, 4))) +
+  geom_text(data = slope.act, aes(x=Neuropil, y=-0.5, label=paste('R2 =',round(r2.pgls1, 2))))
+```
+
+## Figure 8: Migratory vs non-migratory
+
+# 8A: Grade shift index
+```{r}
+rm('neuropil_pgls', 'tmp_pgls')
+
+for (i in 1:length(ssuper)) {
+  dtmp <- as.data.frame(subset(moths.var, Neuropil == ssuper[i]))
+  rownames(dtmp) <- dtmp$Species
+  pgls1 <- phylolm(log(mean.V) ~ log(mean.centralV) * Lifestyle.1, data = dtmp, phy = tree, model = "BM", boot = 1000) # allow different slopes
+  pgls2 <- phylolm(log(mean.V) ~ log(mean.centralV) + Lifestyle.1, data = dtmp, phy = tree, model = "BM", boot = 1000) # assume same slope
+  
+  # compare models <- are slopes significantly different?
+  chisq <- linearHypothesis(pgls1, "log(mean.centralV):Lifestyle.1non-migratory = 0")$Chisq[2]
+  p <- linearHypothesis(pgls1, "log(mean.centralV):Lifestyle.1non-migratory = 0")$`Pr(>Chisq)`[2]
+  
+  # compile temp dataframe
+  tmp_pgls <- data.frame(Neuropil = ssuper[i],
+                         r2.pgls1 = pgls1$adj.r.squared,
+                         r2.pgls2 = pgls2$adj.r.squared,
+                         intercept.mig = pgls2$coefficients[1],
+                         intercept.non = pgls2$coefficients[1] + pgls2$coefficients[3],
+                         slope.mig = pgls1$coefficients[2],
+                         slope.non = pgls1$coefficients[2] + pgls1$coefficients[4],
+                         slopetest.comp.chisq = chisq,
+                         slopetest.comp.p = p,
+                         intercepttest.comp.chisq = linearHypothesis(pgls2, "Lifestyle.1non-migratory = 0")$Chisq[2],
+                         intercepttest.comp.p = linearHypothesis(pgls2, "Lifestyle.1non-migratory = 0")$`Pr(>Chisq)`[2],
+                         si.mig = pgls1$coefficients[2] -1,
+                         si.non = pgls1$coefficients[2] + pgls1$coefficients[4] -1
+                         )
+  tmp_pgls$gsi <- ( 10^tmp_pgls$intercept.mig / 10^tmp_pgls$intercept.non ) -1 
+  
+  if (p > 0.05) {
+    tmp_pgls$slope.sig <- FALSE
+  } else {
+    tmp_pgls$slope.sig <- TRUE
+  }
+  
+  if (exists("neuropil_pgls")) {
+    neuropil_pgls <- rbind(neuropil_pgls, tmp_pgls)
+  } else {
+    neuropil_pgls <- tmp_pgls
+  }
+}
+# If R-squared is below 0.6, or slopes are significantly different, disregard:
+for (i in 1:length(neuropil_pgls$r2.pgls2)) {
+    if (neuropil_pgls$r2.pgls2[i] <0.6 | neuropil_pgls$slopetest.comp.p[i] <0.05) {
+    neuropil_pgls$keep[i] <- FALSE
+  } else {
+    neuropil_pgls$keep[i] <- TRUE
+  }
+  
+  rm("p", "chisq")
+}
+
+pgls.lifestyle.nav <- neuropil_pgls
+
+# plot
+ggplot(subset(pgls.lifestyle.nav, keep == TRUE), aes(x=Neuropil, y=gsi)) + 
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  geom_text(data = subset(pgls.lifestyle.nav, keep == TRUE), aes(x=Neuropil, y=gsi, label=round(intercepttest.comp.p, 4)), vjust=-0.1) +
+  geom_text(data = subset(pgls.lifestyle.nav, keep == TRUE), aes(x=Neuropil, y=-0.5, label=round(r2.pgls2, 2)))
+```
+
+
+# 8B: Significant slope index differences (disqualified from grade shift index)
+```{r}
+slope.nav <- pgls.lifestyle.nav %>%
+  filter(slope.sig == "TRUE") %>%
+  subset(select = c(Neuropil, si.mig, si.non, slopetest.comp.p, r2.pgls1)) %>%
+  pivot_longer(c(si.mig, si.non), names_to = "Nav", values_to = "SI") 
+  
+slope.nav <- as.data.frame(slope.nav)
+
+# plot
+ggplot(slope.nav, aes(x=Neuropil, y=SI, fill=Nav)) + 
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_classic() +
+  scale_fill_viridis_d(alpha = 0.7) +
+  geom_text(data = slope.nav, aes(x=Neuropil, y=SI, label=round(slopetest.comp.p, 4))) +
+  geom_text(data = slope.nav, aes(x=Neuropil, y=-0.5, label=paste('R2 =',round(r2.pgls1, 2))))
+```
+
+# 8C: PGLS regressions for neuropils with slope index differences
+```{r}
+# Use this code block to plot slope index differences for diurnal/nocturnal
+# (Lifestyle.2) or migratory/non-migratory (Lifestyle.1) by replacing Lifestyle
+# variable in the model. Change variable "neuro" to neuropil of interest.
+rm(dsub)
+neuro <- "ML"
+dsub <- as.data.frame(subset(moths.var, Neuropil == neuro))
+rownames(dsub) <- dsub$Species
+
+pgls_phylolm <- phylolm(log(mean.V) ~ log(mean.centralV) * Lifestyle.2, data = dsub, phy = tree, model = "BM", boot = 1000)
+summary(pgls_phylolm)
+
+# F-test to compare the slope to 1
+linearHypothesis(pgls_phylolm, "log(mean.centralV) = 1") 
+
+# plot
+ggplot(dsub, aes(x = log(mean.centralV), y = log(mean.V), colour = Lifestyle.2)) +
+  geom_point(size = 2) +
+  #geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Log central brain volume - neuropil volume", 
+    y = "Log mean neuropil volume",
+    title = paste("PGLS", neuro, ": Adjusted R-squared =", pgls_phylolm$adj.r.squared)
+  ) +
+  theme_classic() +
+  geom_text(aes(x=log(mean.centralV)+0.2, y=log(mean.V), label=Species)) +
+  geom_abline(intercept = pgls_phylolm$coefficients[[1]], slope = pgls_phylolm$coefficients[[2]], col = 'red') + 
+  geom_abline(intercept = pgls_phylolm$coefficients[[1]]+pgls_phylolm$coefficients[[3]], slope = pgls_phylolm$coefficients[[2]] + pgls_phylolm$coefficients[[4]], col = 'turquoise') +  
+  geom_abline(intercept = -5, slope = 1, col = 'grey') 
+```
+
